@@ -30,7 +30,7 @@ The app includes a configurable command filter with both an **allowlist** and a 
 
 Click **"Command Filters"** at the bottom of the app window to expand the filter panel with two side-by-side editors. Changes are saved automatically after you stop typing and pushed to the running server in real time — no restart needed.
 
-Filters are stored in `~/.claude-root-helper.json`:
+Filters are stored in `~/.claude-root-helper-filters.json`:
 
 ```json
 {

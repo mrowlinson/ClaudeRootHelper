@@ -34,7 +34,7 @@ class RootServer {
             blockRules = []
             return
         }
-        let configPath = "\(home)/.claude-root-helper.json"
+        let configPath = "\(home)/.claude-root-helper-filters.json"
         guard let data = FileManager.default.contents(atPath: configPath),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             allowRules = []
@@ -383,7 +383,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     var lastLogOffset: UInt64 = 0
     var helperRunning = false
     let appPidPath = NSHomeDirectory() + "/.claude-root-helper.pid"
-    let configPath = NSHomeDirectory() + "/.claude-root-helper.json"
+    let configPath = NSHomeDirectory() + "/.claude-root-helper-filters.json"
 
     // Filter panel (bottom of main window)
     var filterToggle: NSButton!
