@@ -11,17 +11,57 @@ class RootServer {
     let orphanCheckInterval: TimeInterval = 3
 
     var appPidPath: String
+    var homePath: String?
     var allowedUID: uid_t?
+    var allowRules: [String] = []
+    var blockRules: [String] = []
     var startTime = Date()
     var cmdCount = 0
     var logHandle: FileHandle?
 
     init(home: String?) {
+        self.homePath = home
         if let home = home {
             appPidPath = "\(home)/.claude-root-helper.pid"
         } else {
             appPidPath = "/tmp/claude-root-helper-app.pid"
         }
+    }
+
+    func loadConfig() {
+        guard let home = homePath else {
+            allowRules = []
+            blockRules = []
+            return
+        }
+        let configPath = "\(home)/.claude-root-helper.json"
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            allowRules = []
+            blockRules = []
+            log("No command filter config found")
+            return
+        }
+        allowRules = json["allow"] as? [String] ?? []
+        blockRules = json["block"] as? [String] ?? []
+        log("Loaded filter config: \(allowRules.count) allow, \(blockRules.count) block rules")
+    }
+
+    func commandAllowed(_ cmd: String) -> (allowed: Bool, reason: String?) {
+        // Check allowlist first — if non-empty, first token must match
+        if !allowRules.isEmpty {
+            let firstToken = String(cmd.split(separator: " ", maxSplits: 1).first ?? Substring(cmd))
+            if !allowRules.contains(firstToken) {
+                return (false, "Command not in allowlist")
+            }
+        }
+        // Check blocklist — if any rule is a substring of cmd, reject
+        for rule in blockRules {
+            if cmd.contains(rule) {
+                return (false, "Blocked by rule: \"\(rule)\"")
+            }
+        }
+        return (true, nil)
     }
 
     func log(_ message: String, level: String = "INFO") {
@@ -118,6 +158,21 @@ class RootServer {
             let uptime = Int(Date().timeIntervalSince(startTime))
             let info = "{\"uptime\":\(uptime),\"commands\":\(cmdCount),\"pid\":\(getpid())}"
             sendResponse(clientFd, exitCode: 0, stdout: info + "\n", stderr: "")
+            return
+        }
+
+        if cmd == "__reload__" {
+            loadConfig()
+            sendResponse(clientFd, exitCode: 0, stdout: "Config reloaded\n", stderr: "")
+            return
+        }
+
+        // Command filtering
+        let filterResult = commandAllowed(cmd)
+        if !filterResult.allowed {
+            let reason = filterResult.reason ?? "Blocked by filter"
+            log("BLOCKED: \(cmd) — \(reason)", level: "WARNING")
+            sendResponse(clientFd, exitCode: 1, stdout: "", stderr: "claude-root-helper: \(reason)\n")
             return
         }
 
@@ -234,6 +289,7 @@ class RootServer {
         logHandle?.seekToEndOfFile()
 
         installClient()
+        loadConfig()
 
         // Determine allowed UID from PID file owner
         if let attrs = try? FileManager.default.attributesOfItem(atPath: appPidPath),
@@ -309,9 +365,15 @@ class RootServer {
     }
 }
 
+// MARK: - Click-through placeholder label
+
+class PlaceholderLabel: NSTextField {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 // MARK: - GUI App
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     var window: NSWindow!
     var statusDot: NSTextField!
     var statusText: NSTextField!
@@ -321,12 +383,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     var lastLogOffset: UInt64 = 0
     var helperRunning = false
     let appPidPath = NSHomeDirectory() + "/.claude-root-helper.pid"
+    let configPath = NSHomeDirectory() + "/.claude-root-helper.json"
+
+    // Filter panel (bottom of main window)
+    var filterToggle: NSButton!
+    var filterContainer: NSView!
+    var allowTextView: NSTextView!
+    var blockTextView: NSTextView!
+    var allowPlaceholder: PlaceholderLabel!
+    var blockPlaceholder: PlaceholderLabel!
+    var filterSaveTimer: Timer?
+    var toggleBottomCollapsed: NSLayoutConstraint!
+    var filterBottomExpanded: NSLayoutConstraint!
+    var filtersExpanded = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
         writeAppPid()
         setupMenuBar()
         setupWindow()
+        loadFilterConfig()
+        updatePlaceholders()
 
         if pingHelper() {
             helperRunning = true
@@ -355,6 +432,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.mainMenu = menuBar
     }
 
+    func makeFilterTextView() -> (NSScrollView, NSTextView, PlaceholderLabel) {
+        let sv = NSScrollView()
+        sv.translatesAutoresizingMaskIntoConstraints = false
+        sv.hasVerticalScroller = true
+        sv.borderType = .bezelBorder
+        sv.autohidesScrollers = true
+
+        let tv = NSTextView()
+        tv.isEditable = true
+        tv.isSelectable = true
+        tv.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        tv.backgroundColor = NSColor(white: 0.12, alpha: 1.0)
+        tv.textColor = NSColor(white: 0.85, alpha: 1.0)
+        tv.insertionPointColor = NSColor(white: 0.85, alpha: 1.0)
+        tv.textContainerInset = NSSize(width: 4, height: 4)
+        tv.delegate = self
+        tv.isAutomaticQuoteSubstitutionEnabled = false
+        tv.isAutomaticDashSubstitutionEnabled = false
+        tv.isAutomaticTextReplacementEnabled = false
+
+        sv.documentView = tv
+
+        let ph = PlaceholderLabel(labelWithString: "one rule per line")
+        ph.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+        ph.textColor = NSColor(white: 0.35, alpha: 1.0)
+        ph.backgroundColor = .clear
+        ph.translatesAutoresizingMaskIntoConstraints = false
+
+        return (sv, tv, ph)
+    }
+
     func setupWindow() {
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 620, height: 440),
@@ -363,9 +471,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         window.title = "Claude Root Helper"
         window.center()
-        window.minSize = NSSize(width: 400, height: 250)
+        window.minSize = NSSize(width: 480, height: 300)
         let cv = window.contentView!
 
+        // Status bar
         statusDot = NSTextField(labelWithString: "\u{25CF}")
         statusDot.font = .systemFont(ofSize: 16)
         statusDot.textColor = .systemGray
@@ -377,6 +486,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusText.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(statusText)
 
+        // Log view
         scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
@@ -397,20 +507,129 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         scrollView.documentView = textView
         cv.addSubview(scrollView)
 
+        // Filter toggle bar at the bottom
+        filterToggle = NSButton(title: "Command Filters \u{25B8}", target: self, action: #selector(toggleFilters(_:)))
+        filterToggle.bezelStyle = .inline
+        filterToggle.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(filterToggle)
+
+        // Filter container (hidden by default)
+        filterContainer = NSView()
+        filterContainer.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.isHidden = true
+        cv.addSubview(filterContainer)
+
+        let allowLabel = NSTextField(labelWithString: "Allowed Commands")
+        allowLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        allowLabel.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.addSubview(allowLabel)
+
+        let allowHint = NSTextField(labelWithString: "first word must match")
+        allowHint.font = .systemFont(ofSize: 9)
+        allowHint.textColor = .secondaryLabelColor
+        allowHint.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.addSubview(allowHint)
+
+        let blockLabel = NSTextField(labelWithString: "Blocked Commands")
+        blockLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        blockLabel.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.addSubview(blockLabel)
+
+        let blockHint = NSTextField(labelWithString: "blocked if command contains rule")
+        blockHint.font = .systemFont(ofSize: 9)
+        blockHint.textColor = .secondaryLabelColor
+        blockHint.translatesAutoresizingMaskIntoConstraints = false
+        filterContainer.addSubview(blockHint)
+
+        let (allowSV, allowTV, allowPH) = makeFilterTextView()
+        let (blockSV, blockTV, blockPH) = makeFilterTextView()
+        allowTextView = allowTV
+        blockTextView = blockTV
+        allowPlaceholder = allowPH
+        blockPlaceholder = blockPH
+
+        filterContainer.addSubview(allowSV)
+        filterContainer.addSubview(blockSV)
+        cv.addSubview(allowPH)
+        cv.addSubview(blockPH)
+
+        // Switchable constraints
+        toggleBottomCollapsed = filterToggle.bottomAnchor.constraint(equalTo: cv.bottomAnchor, constant: -14)
+        filterBottomExpanded = filterContainer.bottomAnchor.constraint(equalTo: cv.bottomAnchor, constant: -14)
+        toggleBottomCollapsed.isActive = true
+
         NSLayoutConstraint.activate([
+            // Status bar
             statusDot.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 14),
             statusDot.topAnchor.constraint(equalTo: cv.topAnchor, constant: 10),
             statusText.leadingAnchor.constraint(equalTo: statusDot.trailingAnchor, constant: 6),
             statusText.centerYAnchor.constraint(equalTo: statusDot.centerYAnchor),
             statusText.trailingAnchor.constraint(lessThanOrEqualTo: cv.trailingAnchor, constant: -14),
+
+            // Log view — bottom tied to filter toggle
             scrollView.topAnchor.constraint(equalTo: statusDot.bottomAnchor, constant: 10),
             scrollView.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 14),
             scrollView.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -14),
-            scrollView.bottomAnchor.constraint(equalTo: cv.bottomAnchor, constant: -14),
+            scrollView.bottomAnchor.constraint(equalTo: filterToggle.topAnchor, constant: -8),
+
+            // Toggle bar
+            filterToggle.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 14),
+
+            // Filter container
+            filterContainer.topAnchor.constraint(equalTo: filterToggle.bottomAnchor, constant: 6),
+            filterContainer.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: 14),
+            filterContainer.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -14),
+            filterContainer.heightAnchor.constraint(equalToConstant: 130),
+
+            // Labels and hints inside container
+            allowLabel.topAnchor.constraint(equalTo: filterContainer.topAnchor),
+            allowLabel.leadingAnchor.constraint(equalTo: filterContainer.leadingAnchor),
+
+            allowHint.leadingAnchor.constraint(equalTo: allowLabel.trailingAnchor, constant: 4),
+            allowHint.lastBaselineAnchor.constraint(equalTo: allowLabel.lastBaselineAnchor),
+
+            blockLabel.topAnchor.constraint(equalTo: filterContainer.topAnchor),
+            blockLabel.leadingAnchor.constraint(equalTo: filterContainer.centerXAnchor, constant: 6),
+
+            blockHint.leadingAnchor.constraint(equalTo: blockLabel.trailingAnchor, constant: 4),
+            blockHint.lastBaselineAnchor.constraint(equalTo: blockLabel.lastBaselineAnchor),
+
+            // Text view scroll views
+            allowSV.topAnchor.constraint(equalTo: allowLabel.bottomAnchor, constant: 4),
+            allowSV.leadingAnchor.constraint(equalTo: filterContainer.leadingAnchor),
+            allowSV.trailingAnchor.constraint(equalTo: filterContainer.centerXAnchor, constant: -6),
+            allowSV.bottomAnchor.constraint(equalTo: filterContainer.bottomAnchor),
+
+            blockSV.topAnchor.constraint(equalTo: blockLabel.bottomAnchor, constant: 4),
+            blockSV.leadingAnchor.constraint(equalTo: filterContainer.centerXAnchor, constant: 6),
+            blockSV.trailingAnchor.constraint(equalTo: filterContainer.trailingAnchor),
+            blockSV.bottomAnchor.constraint(equalTo: filterContainer.bottomAnchor),
+
+            // Placeholders positioned over text views
+            allowPH.leadingAnchor.constraint(equalTo: allowSV.leadingAnchor, constant: 8),
+            allowPH.topAnchor.constraint(equalTo: allowSV.topAnchor, constant: 6),
+
+            blockPH.leadingAnchor.constraint(equalTo: blockSV.leadingAnchor, constant: 8),
+            blockPH.topAnchor.constraint(equalTo: blockSV.topAnchor, constant: 6),
         ])
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func toggleFilters(_ sender: Any?) {
+        filtersExpanded = !filtersExpanded
+        filterContainer.isHidden = !filtersExpanded
+        filterToggle.title = filtersExpanded ? "Command Filters \u{25BE}" : "Command Filters \u{25B8}"
+
+        if filtersExpanded {
+            toggleBottomCollapsed.isActive = false
+            filterBottomExpanded.isActive = true
+        } else {
+            filterBottomExpanded.isActive = false
+            toggleBottomCollapsed.isActive = true
+        }
+        updatePlaceholders()
     }
 
     func setStatus(running: Bool, text: String) {
@@ -430,6 +649,52 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ]
         ))
         textView.scrollToEndOfDocument(nil)
+    }
+
+    // MARK: - Filter Config
+
+    func loadFilterConfig() {
+        guard FileManager.default.fileExists(atPath: configPath),
+              let data = FileManager.default.contents(atPath: configPath),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            allowTextView.string = ""
+            blockTextView.string = ""
+            return
+        }
+        allowTextView.string = (json["allow"] as? [String] ?? []).joined(separator: "\n")
+        blockTextView.string = (json["block"] as? [String] ?? []).joined(separator: "\n")
+    }
+
+    func saveFilterConfig() {
+        let allow = allowTextView.string.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let block = blockTextView.string.components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+
+        if allow.isEmpty && block.isEmpty {
+            try? FileManager.default.removeItem(atPath: configPath)
+        } else {
+            let config: [String: Any] = ["allow": allow, "block": block]
+            if let data = try? JSONSerialization.data(withJSONObject: config, options: .prettyPrinted) {
+                try? data.write(to: URL(fileURLWithPath: configPath))
+            }
+        }
+        sendSocketCommand("__reload__")
+    }
+
+    func updatePlaceholders() {
+        allowPlaceholder?.isHidden = !allowTextView.string.isEmpty || !filtersExpanded
+        blockPlaceholder?.isHidden = !blockTextView.string.isEmpty || !filtersExpanded
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard let tv = notification.object as? NSTextView,
+              tv === allowTextView || tv === blockTextView else { return }
+        updatePlaceholders()
+        filterSaveTimer?.invalidate()
+        filterSaveTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            self?.saveFilterConfig()
+        }
     }
 
     // MARK: - Helper Management
@@ -565,6 +830,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
                 let color: NSColor = line.contains("CMD:") ? .systemCyan :
+                                     line.contains("BLOCKED:") ? .systemOrange :
                                      line.contains("ERROR") ? .systemRed :
                                      NSColor(white: 0.55, alpha: 1.0)
                 self?.textView.textStorage?.append(NSAttributedString(

@@ -21,9 +21,29 @@ When you quit the app, a watchdog in the server detects the app is gone and shut
 - **Auto-shutdown** — the server watchdog exits automatically when the app quits, so the root server doesn't linger.
 - **Socket permissions** — the socket is `0660` owned by `root:staff`, plus the UID check above.
 
+### Command Filters
+
+The app includes a configurable command filter with both an **allowlist** and a **blocklist**, active simultaneously:
+
+- **Allowed Commands** — if any entries are present, the first word of the command must match one of them. Commands not on the list are rejected.
+- **Blocked Commands** — if any entry appears as a substring anywhere in the command, it's rejected.
+
+Click **"Command Filters"** at the bottom of the app window to expand the filter panel with two side-by-side editors. Changes are saved automatically after you stop typing and pushed to the running server in real time — no restart needed.
+
+Filters are stored in `~/.claude-root-helper.json`:
+
+```json
+{
+  "allow": ["brew", "launchctl", "cat", "ls"],
+  "block": ["rm -rf /", "shutdown", "reboot", "mkfs", "dd"]
+}
+```
+
+If the config file doesn't exist or both lists are empty, no filtering is applied.
+
 ### Caveats
 
-- This is an **unrestricted root shell** for the authenticated user. Any command sent through the socket is executed as root via `/bin/sh -c`. There is no command allowlist.
+- **Without filters configured**, this is an unrestricted root shell for the authenticated user. Configure allowlist/blocklist rules for additional safety.
 - Intended for **single-user development machines** during active use. Do not leave it running unattended on a shared system.
 
 ## Build
@@ -39,6 +59,7 @@ Requires Xcode command-line tools (`swiftc`). Produces `ClaudeRootHelper.app` in
 1. Double-click `ClaudeRootHelper.app` (or `open ClaudeRootHelper.app` from terminal)
 2. Enter your admin password when prompted
 3. The app window shows a green status dot and a live log of commands
+4. (Optional) Expand **"Command Filters"** at the bottom to configure allow/block rules
 
 Run commands as root:
 
@@ -51,7 +72,7 @@ claude-root-cmd --cwd /etc cat hosts
 claude-root-cmd --timeout 30 some-long-running-command
 ```
 
-4. Quit the app when done — the root server stops automatically
+5. Quit the app when done — the root server stops automatically
 
 ## Claude Code integration
 
