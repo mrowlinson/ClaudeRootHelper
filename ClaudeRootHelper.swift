@@ -379,8 +379,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     var statusText: NSTextField!
     var scrollView: NSScrollView!
     var textView: NSTextView!
-    var logTimer: Timer?
+    var logSource: DispatchSourceFileSystemObject?
+    var logFd: Int32 = -1
     var lastLogOffset: UInt64 = 0
+    let maxLogLines = 2000
     var helperRunning = false
     let appPidPath = NSHomeDirectory() + "/.claude-root-helper.pid"
     let configPath = NSHomeDirectory() + "/.claude-root-helper-filters.json"
@@ -814,12 +816,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
            let size = attrs[.size] as? UInt64 {
             lastLogOffset = size
         }
-        logTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.pollLog()
+
+        // Watch the log file with kqueue instead of polling
+        logFd = Darwin.open(logPath, O_RDONLY | O_EVTONLY)
+        guard logFd >= 0 else { return }
+
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: logFd, eventMask: [.write, .extend], queue: .global()
+        )
+        source.setEventHandler { [weak self] in
+            self?.readNewLogData()
         }
+        source.setCancelHandler { [weak self] in
+            if let fd = self?.logFd, fd >= 0 {
+                Darwin.close(fd)
+                self?.logFd = -1
+            }
+        }
+        source.resume()
+        logSource = source
     }
 
-    func pollLog() {
+    func readNewLogData() {
         guard let fh = FileHandle(forReadingAtPath: "/var/log/claude-root-helper.log") else { return }
         defer { fh.closeFile() }
         fh.seek(toFileOffset: lastLogOffset)
@@ -828,12 +846,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
         guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
 
         DispatchQueue.main.async { [weak self] in
+            guard let self = self, let storage = self.textView.textStorage else { return }
+
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
                 let color: NSColor = line.contains("CMD:") ? .systemCyan :
                                      line.contains("BLOCKED:") ? .systemOrange :
                                      line.contains("ERROR") ? .systemRed :
                                      NSColor(white: 0.55, alpha: 1.0)
-                self?.textView.textStorage?.append(NSAttributedString(
+                storage.append(NSAttributedString(
                     string: line + "\n",
                     attributes: [
                         .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
@@ -841,7 +861,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
                     ]
                 ))
             }
-            self?.textView.scrollToEndOfDocument(nil)
+
+            // Trim to maxLogLines to bound memory
+            let fullText = storage.string
+            let lines = fullText.components(separatedBy: "\n")
+            if lines.count > self.maxLogLines {
+                let excess = lines[0..<(lines.count - self.maxLogLines)].joined(separator: "\n").count + 1
+                storage.deleteCharacters(in: NSRange(location: 0, length: excess))
+            }
+
+            self.textView.scrollToEndOfDocument(nil)
         }
     }
 
@@ -850,7 +879,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSTextViewDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
     func applicationWillTerminate(_ notification: Notification) {
-        logTimer?.invalidate()
+        logSource?.cancel()
         try? FileManager.default.removeItem(atPath: appPidPath)
         if helperRunning {
             sendSocketCommand("__quit__")
