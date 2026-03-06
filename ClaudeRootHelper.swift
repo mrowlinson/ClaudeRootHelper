@@ -1,5 +1,316 @@
 import Cocoa
 
+// MARK: - Root Server (runs as root when invoked with --server)
+
+class RootServer {
+    let socketPath = "/var/run/claude-root-helper.sock"
+    let pidPath = "/var/run/claude-root-helper.pid"
+    let logPath = "/var/log/claude-root-helper.log"
+    let clientInstallPath = "/usr/local/bin/claude-root-cmd"
+    let allowedGID: gid_t = 20  // staff group
+    let orphanCheckInterval: TimeInterval = 3
+
+    var appPidPath: String
+    var allowedUID: uid_t?
+    var startTime = Date()
+    var cmdCount = 0
+    var logHandle: FileHandle?
+
+    init(home: String?) {
+        if let home = home {
+            appPidPath = "\(home)/.claude-root-helper.pid"
+        } else {
+            appPidPath = "/tmp/claude-root-helper-app.pid"
+        }
+    }
+
+    func log(_ message: String, level: String = "INFO") {
+        let df = DateFormatter()
+        df.dateFormat = "yyyy-MM-dd HH:mm:ss,SSS"
+        let line = "\(df.string(from: Date())) [\(level)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            logHandle?.write(data)
+        }
+    }
+
+    func installClient() {
+        let exe = Bundle.main.executablePath ?? CommandLine.arguments[0]
+        let candidates = [
+            (exe as NSString).deletingLastPathComponent + "/../Resources/claude-root-cmd",
+            (exe as NSString).deletingLastPathComponent + "/claude-root-cmd",
+            (Bundle.main.bundlePath as NSString).deletingLastPathComponent + "/claude-root-cmd"
+        ]
+        for src in candidates {
+            if FileManager.default.fileExists(atPath: src) {
+                try? FileManager.default.removeItem(atPath: clientInstallPath)
+                try? FileManager.default.copyItem(atPath: src, toPath: clientInstallPath)
+                chmod(clientInstallPath, 0o755)
+                log("Installed client to \(clientInstallPath)")
+                return
+            }
+        }
+    }
+
+    func getPeerUID(_ fd: Int32) -> uid_t? {
+        // struct xucred { u_int cr_version; uid_t cr_uid; short cr_ngroups; gid_t cr_groups[16]; }
+        let xucredSize = 4 + 4 + 2 + 2 + (16 * 4)  // 76 bytes
+        var buf = [UInt8](repeating: 0, count: xucredSize)
+        var len = socklen_t(xucredSize)
+        let ret = getsockopt(fd, 0 /* SOL_LOCAL */, 0x001 /* LOCAL_PEERCRED */, &buf, &len)
+        guard ret == 0 else { return nil }
+        return buf.withUnsafeBufferPointer { ptr -> uid_t in
+            ptr.baseAddress!.advanced(by: 4).withMemoryRebound(to: uid_t.self, capacity: 1) { $0.pointee }
+        }
+    }
+
+    func sendResponse(_ fd: Int32, exitCode: Int, stdout: String, stderr: String) {
+        let response: [String: Any] = ["exit_code": exitCode, "stdout": stdout, "stderr": stderr]
+        if let data = try? JSONSerialization.data(withJSONObject: response),
+           var str = String(data: data, encoding: .utf8) {
+            str += "\n"
+            _ = str.withCString { send(fd, $0, strlen($0), 0) }
+        }
+    }
+
+    func handleClient(_ clientFd: Int32) {
+        defer { close(clientFd) }
+
+        // Check peer UID
+        if let peerUID = getPeerUID(clientFd), let allowed = allowedUID {
+            if peerUID != allowed && peerUID != 0 {
+                log("Rejected connection from UID \(peerUID) (allowed: \(allowed))", level: "WARNING")
+                return
+            }
+        }
+
+        // Read request
+        var data = Data()
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = recv(clientFd, &buf, buf.count, 0)
+            if n <= 0 { break }
+            data.append(contentsOf: buf[0..<n])
+            if data.contains(UInt8(ascii: "\n")) { break }
+        }
+
+        guard let str = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let json = try? JSONSerialization.jsonObject(with: Data(str.utf8)) as? [String: Any],
+              let cmd = json["command"] as? String else {
+            return
+        }
+
+        let timeout = json["timeout"] as? Int ?? 120
+        let cwd = json["cwd"] as? String ?? "/"
+
+        if cmd == "__ping__" {
+            sendResponse(clientFd, exitCode: 0, stdout: "pong\n", stderr: "")
+            return
+        }
+
+        if cmd == "__quit__" {
+            sendResponse(clientFd, exitCode: 0, stdout: "Shutting down\n", stderr: "")
+            log("Quit command received, shutting down")
+            cleanup()
+            exit(0)
+        }
+
+        if cmd == "__status__" {
+            let uptime = Int(Date().timeIntervalSince(startTime))
+            let info = "{\"uptime\":\(uptime),\"commands\":\(cmdCount),\"pid\":\(getpid())}"
+            sendResponse(clientFd, exitCode: 0, stdout: info + "\n", stderr: "")
+            return
+        }
+
+        cmdCount += 1
+        log("CMD: \(cmd) (cwd=\(cwd), timeout=\(timeout))")
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/sh")
+        process.arguments = ["-c", cmd]
+        process.currentDirectoryURL = URL(fileURLWithPath: cwd)
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        process.environment = env
+
+        let outPipe = Pipe()
+        let errPipe = Pipe()
+        process.standardOutput = outPipe
+        process.standardError = errPipe
+
+        do {
+            try process.run()
+
+            // Read stdout/stderr concurrently to avoid pipe buffer deadlock
+            var stdoutStr = ""
+            var stderrStr = ""
+            let group = DispatchGroup()
+
+            group.enter()
+            DispatchQueue.global().async {
+                let d = outPipe.fileHandleForReading.readDataToEndOfFile()
+                stdoutStr = String(data: d, encoding: .utf8) ?? ""
+                group.leave()
+            }
+
+            group.enter()
+            DispatchQueue.global().async {
+                let d = errPipe.fileHandleForReading.readDataToEndOfFile()
+                stderrStr = String(data: d, encoding: .utf8) ?? ""
+                group.leave()
+            }
+
+            // Timeout
+            var timedOut = false
+            let timer = DispatchSource.makeTimerSource(queue: .global())
+            timer.schedule(deadline: .now() + .seconds(timeout))
+            timer.setEventHandler {
+                if process.isRunning {
+                    timedOut = true
+                    process.terminate()
+                }
+            }
+            timer.resume()
+
+            process.waitUntilExit()
+            timer.cancel()
+            group.wait()
+
+            if timedOut {
+                log("EXIT: timeout")
+                sendResponse(clientFd, exitCode: 124, stdout: stdoutStr, stderr: "Command timed out after \(timeout)s\n")
+            } else {
+                log("EXIT: \(process.terminationStatus)")
+                sendResponse(clientFd, exitCode: Int(process.terminationStatus), stdout: stdoutStr, stderr: stderrStr)
+            }
+        } catch {
+            log("Error running command: \(error.localizedDescription)", level: "ERROR")
+            sendResponse(clientFd, exitCode: 1, stdout: "", stderr: error.localizedDescription)
+        }
+    }
+
+    func cleanup() {
+        for path in [socketPath, pidPath] {
+            unlink(path)
+        }
+    }
+
+    func appPidAlive(_ pid: pid_t) -> Bool {
+        let ret = kill(pid, 0)
+        if ret == 0 { return true }
+        return errno == EPERM
+    }
+
+    func startWatchdog() {
+        DispatchQueue.global().async { [weak self] in
+            while true {
+                Thread.sleep(forTimeInterval: self?.orphanCheckInterval ?? 3)
+                guard let self = self else { return }
+
+                guard FileManager.default.fileExists(atPath: self.appPidPath) else {
+                    self.log("App PID file gone, shutting down")
+                    self.cleanup()
+                    exit(0)
+                }
+
+                guard let pidStr = try? String(contentsOfFile: self.appPidPath, encoding: .utf8)
+                        .trimmingCharacters(in: .whitespacesAndNewlines),
+                      let pid = pid_t(pidStr) else {
+                    continue
+                }
+
+                if !self.appPidAlive(pid) {
+                    self.log("App (PID \(pid)) is no longer running, shutting down")
+                    self.cleanup()
+                    exit(0)
+                }
+            }
+        }
+    }
+
+    func run() -> Never {
+        // Set up logging
+        FileManager.default.createFile(atPath: logPath, contents: nil)
+        logHandle = FileHandle(forWritingAtPath: logPath)
+        logHandle?.seekToEndOfFile()
+
+        installClient()
+
+        // Determine allowed UID from PID file owner
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: appPidPath),
+           let uid = attrs[.ownerAccountID] as? NSNumber {
+            allowedUID = uid.uint32Value
+            log("Restricting access to UID \(allowedUID!)")
+        } else {
+            log("App PID file not found, allowing any staff-group user", level: "WARNING")
+        }
+
+        // Clean up old socket
+        unlink(socketPath)
+
+        // Write PID file
+        try? "\(getpid())".write(toFile: pidPath, atomically: true, encoding: .utf8)
+
+        // Create and bind socket
+        let serverFd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard serverFd >= 0 else {
+            log("Failed to create socket", level: "ERROR")
+            exit(1)
+        }
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutablePointer(to: &addr.sun_path.0) { ptr in
+            socketPath.withCString { strcpy(ptr, $0) }
+        }
+
+        let bindResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(serverFd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bindResult == 0 else {
+            log("Failed to bind socket: \(String(cString: strerror(errno)))", level: "ERROR")
+            exit(1)
+        }
+
+        chmod(socketPath, 0o660)
+        chown(socketPath, 0, allowedGID)
+        listen(serverFd, 5)
+
+        startWatchdog()
+
+        signal(SIGTERM, SIG_IGN)
+        signal(SIGINT, SIG_IGN)
+
+        let termSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .global())
+        termSource.setEventHandler { [weak self] in
+            self?.log("SIGTERM received, shutting down")
+            self?.cleanup()
+            exit(0)
+        }
+        termSource.resume()
+
+        let intSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: .global())
+        intSource.setEventHandler { [weak self] in
+            self?.log("SIGINT received, shutting down")
+            self?.cleanup()
+            exit(0)
+        }
+        intSource.resume()
+
+        log("Root helper started (PID \(getpid()))")
+
+        while true {
+            let clientFd = accept(serverFd, nil, nil)
+            if clientFd >= 0 {
+                handleClient(clientFd)
+            }
+        }
+    }
+}
+
+// MARK: - GUI App
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var statusDot: NSTextField!
@@ -18,7 +329,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         setupWindow()
 
         if pingHelper() {
-            // Adopt the existing helper — update the app PID it watches
             helperRunning = true
             setStatus(running: true, text: "Connected to existing helper")
             appendLog("Connected to already-running root helper", color: .systemGreen)
@@ -56,7 +366,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.minSize = NSSize(width: 400, height: 250)
         let cv = window.contentView!
 
-        // Status bar
         statusDot = NSTextField(labelWithString: "\u{25CF}")
         statusDot.font = .systemFont(ofSize: 16)
         statusDot.textColor = .systemGray
@@ -68,7 +377,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusText.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(statusText)
 
-        // Log view
         scrollView = NSScrollView()
         scrollView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.hasVerticalScroller = true
@@ -126,36 +434,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Helper Management
 
-    func serverScriptPath() -> String {
-        // Check inside .app bundle first, then next to the binary
-        if let bundled = Bundle.main.path(forResource: "server", ofType: "py") {
-            return bundled
-        }
-        let alongside = (Bundle.main.executablePath! as NSString)
-            .deletingLastPathComponent + "/server.py"
-        if FileManager.default.fileExists(atPath: alongside) {
-            return alongside
-        }
-        // Fall back to project directory
-        return (Bundle.main.bundlePath as NSString)
-            .deletingLastPathComponent + "/server.py"
-    }
-
     func startHelper() {
         appendLog("Requesting administrator privileges\u{2026}", color: .systemYellow)
 
-        let path = serverScriptPath()
-        let escaped = path.replacingOccurrences(of: "'", with: "'\\''")
+        let exe = Bundle.main.executablePath!
+        let escaped = exe.replacingOccurrences(of: "'", with: "'\\''")
+        let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "'\\''")
 
         DispatchQueue.global().async { [weak self] in
             guard let self = self else { return }
 
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            let home = NSHomeDirectory().replacingOccurrences(of: "'", with: "'\\''")
             process.arguments = [
                 "-e",
-                "do shell script \"/usr/bin/python3 '\(escaped)' --home '\(home)' </dev/null >/dev/null 2>&1 &\" with administrator privileges"
+                "do shell script \"'\(escaped)' --server --home '\(home)' </dev/null >/dev/null 2>&1 &\" with administrator privileges"
             ]
             let errPipe = Pipe()
             process.standardError = errPipe
@@ -175,7 +468,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             let errStr = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-            // Give server a moment to bind the socket
             Thread.sleep(forTimeInterval: 1.5)
 
             DispatchQueue.main.async {
@@ -293,8 +585,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         logTimer?.invalidate()
-        // Remove app PID file — watchdog will kill the server within seconds
-        // Also send quit directly as a fast path
         try? FileManager.default.removeItem(atPath: appPidPath)
         if helperRunning {
             sendSocketCommand("__quit__")
@@ -302,8 +592,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.setActivationPolicy(.regular)
-app.run()
+// MARK: - Entry Point
+
+if CommandLine.arguments.contains("--server") {
+    // Server mode — running as root
+    var home: String?
+    if let idx = CommandLine.arguments.firstIndex(of: "--home"),
+       idx + 1 < CommandLine.arguments.count {
+        home = CommandLine.arguments[idx + 1]
+    }
+    let server = RootServer(home: home)
+    server.run()
+} else {
+    // GUI mode
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.setActivationPolicy(.regular)
+    app.run()
+}

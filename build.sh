@@ -9,20 +9,23 @@ echo "Building ClaudeRootHelper..."
 # Clean
 rm -rf "$APP"
 
-# Compile
+# Compile app
 swiftc "$DIR/ClaudeRootHelper.swift" \
     -o "$DIR/ClaudeRootHelper_bin" \
     -framework Cocoa \
+    -O
+
+# Compile client
+swiftc "$DIR/claude-root-cmd.swift" \
+    -o "$DIR/claude-root-cmd_bin" \
     -O
 
 # Create .app bundle
 mkdir -p "$APP/Contents/MacOS"
 mkdir -p "$APP/Contents/Resources"
 mv "$DIR/ClaudeRootHelper_bin" "$APP/Contents/MacOS/ClaudeRootHelper"
+mv "$DIR/claude-root-cmd_bin" "$APP/Contents/Resources/claude-root-cmd"
 cp "$DIR/Info.plist" "$APP/Contents/"
-cp "$DIR/server.py" "$APP/Contents/Resources/"
-cp "$DIR/claude-root-cmd" "$APP/Contents/Resources/"
-chmod +x "$APP/Contents/Resources/claude-root-cmd"
 
 # Ad-hoc sign
 codesign --force --deep --sign - "$APP"
