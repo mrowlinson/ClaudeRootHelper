@@ -1,8 +1,8 @@
 # Claude Root Helper
 
-A lightweight macOS app that provides root command execution over a local Unix domain socket, without requiring `sudo` in the terminal.
+A lightweight macOS app that gives Claude Code (or any CLI tool) a way to run commands as root without needing `sudo` in the terminal.
 
-Some CLI tools and sandboxed environments restrict direct use of `sudo`. This helper runs a small root-privileged server in the background, authenticated via macOS's native admin password prompt. A companion CLI tool (`claude-root-cmd`) sends commands to the server and returns the result.
+Claude Code restricts direct use of `sudo`. This helper runs a small root-privileged server in the background, authenticated via macOS's native admin password prompt. A companion CLI tool (`claude-root-cmd`) sends commands to the server and returns the result.
 
 Launch the app when you need root access, quit it when you're done.
 
@@ -52,6 +52,14 @@ claude-root-cmd --timeout 30 some-long-running-command
 ```
 
 4. Quit the app when done — the root server stops automatically
+
+## Claude Code integration
+
+Add this to your `CLAUDE.md` or project instructions:
+
+```
+Use `claude-root-cmd <command>` instead of `sudo` when root access is needed.
+```
 
 ## Requirements
 
