@@ -76,10 +76,13 @@ claude-root-cmd --timeout 30 some-long-running-command
 
 ## Claude Code integration
 
-Add this to your `CLAUDE.md` or project instructions:
+Add this to your global Claude settings (`~/.claude/CLAUDE.md`) so Claude automatically uses the helper when it's running and falls back to `sudo` when it's not:
 
-```
-Use `claude-root-cmd <command>` instead of `sudo` when root access is needed.
+```markdown
+**Root helper app** at /path/to/ClaudeRootHelper.app. When it's running, use
+`claude-root-cmd <command>` instead of `sudo`. Supports `--cwd DIR` and
+`--timeout SECS`. If `claude-root-cmd` is not available or the helper isn't
+running, fall back to `sudo` as normal.
 ```
 
 ## Requirements
