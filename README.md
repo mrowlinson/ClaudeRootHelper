@@ -8,9 +8,9 @@ Launch the app when you need root access, quit it when you're done.
 
 ## How it works
 
-1. **ClaudeRootHelper.app** — a Swift/Cocoa GUI app. On launch it uses `osascript` to start a Python server with administrator privileges (you enter your password once via the standard macOS dialog).
-2. **server.py** — runs as root, listens on a Unix domain socket at `/var/run/claude-root-helper.sock`. Executes commands sent by the client and returns stdout/stderr/exit code.
-3. **claude-root-cmd** — a Python CLI client installed to `/usr/local/bin/`. Sends a command to the server and prints the result.
+1. **ClaudeRootHelper.app** — a Swift/Cocoa GUI app. On launch it uses `osascript` to start a root-privileged server (itself, with `--server`) via the standard macOS admin password dialog.
+2. **Server mode** — the same binary runs as root, listening on a Unix domain socket at `/var/run/claude-root-helper.sock`. Executes commands and returns stdout/stderr/exit code.
+3. **claude-root-cmd** — a compiled Swift CLI client installed to `/usr/local/bin/`. Sends a command to the server and prints the result.
 
 When you quit the app, a watchdog in the server detects the app is gone and shuts itself down within seconds.
 
@@ -23,7 +23,7 @@ When you quit the app, a watchdog in the server detects the app is gone and shut
 
 ### Caveats
 
-- This is an **unrestricted root shell** for the authenticated user. Any command sent through the socket is executed as root with `shell=True`. There is no command allowlist.
+- This is an **unrestricted root shell** for the authenticated user. Any command sent through the socket is executed as root via `/bin/sh -c`. There is no command allowlist.
 - Intended for **single-user development machines** during active use. Do not leave it running unattended on a shared system.
 
 ## Build
@@ -64,7 +64,6 @@ Use `claude-root-cmd <command>` instead of `sudo` when root access is needed.
 ## Requirements
 
 - macOS 13.0+
-- Python 3 (included with macOS)
 - Xcode command-line tools (for building)
 
 ## License
